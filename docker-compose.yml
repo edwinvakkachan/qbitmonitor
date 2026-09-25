@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  qbitmangement:
+    build: .
+    container_name: qbitmangement
+    restart: unless-stopped
+    environment:
+      QBIT_URL: ${QBIT_URL}
+      QBIT_USERNAME: ${QBIT_USERNAME}
+      QBIT_PASSWORD: ${QBIT_PASSWORD}
+      MONGO_URI: ${MONGO_URI}
+      MONGO_DB: ${MONGO_DB}
+      MONGO_COLLECTION: ${MONGO_COLLECTION}
+      CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS}
+      FAILURE_THRESHOLD_MINUTESKEY: ${FAILURE_THRESHOLD_MINUTES}
+      STALLED_THRESHOLD_MINUTES: ${STALLED_THRESHOLD_MINUTES}
+      HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS}
+
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
