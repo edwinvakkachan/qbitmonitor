@@ -20,26 +20,28 @@ const MONGO_COLLECTION =
 const CHECK_INTERVAL =
   Number(process.env.CHECK_INTERVAL_SECONDS || 30) * 1000;
 
-// Delete only after 20 continuous minutes
+// Delete after 20 continuous minutes
 const FAILURE_THRESHOLD =
   Number(process.env.FAILURE_THRESHOLD_MINUTES || 20) * 60 * 1000;
+
+// Startup grace period.
+// During this period NOTHING can be deleted.
+const STARTUP_GRACE_PERIOD =
+  Number(process.env.STARTUP_GRACE_MINUTES || 10) * 60 * 1000;
 
 // HTTP timeout
 const HTTP_TIMEOUT =
   Number(process.env.HTTP_TIMEOUT_SECONDS || 15) * 1000;
 
-// A torrent must have no useful activity for this long
-// before a stalled torrent can be considered dead.
-const STALLED_THRESHOLD =
-  Number(process.env.STALLED_THRESHOLD_MINUTES || 20) * 60 * 1000;
-
 // ============================================================
-// VALIDATION
+// VALIDATE ENVIRONMENT
 // ============================================================
 
 function requireEnv(name) {
   if (!process.env[name]) {
-    throw new Error(`Missing required environment variable: ${name}`);
+    throw new Error(
+      `Missing required environment variable: ${name}`
+    );
   }
 }
 
@@ -52,7 +54,7 @@ function requireEnv(name) {
 ].forEach(requireEnv);
 
 // ============================================================
-// GLOBALS
+// GLOBAL STATE
 // ============================================================
 
 let mongoClient;
@@ -60,6 +62,18 @@ let collection;
 
 let qbitLoggedIn = false;
 let monitorRunning = false;
+
+// Every time the monitor starts, it gets a NEW session ID.
+//
+// This is important.
+//
+// A torrent that was failing before a 4-hour shutdown must
+// NOT continue its old failure timer after startup.
+const MONITOR_SESSION_ID =
+  new Date().toISOString();
+
+const MONITOR_STARTED_AT =
+  Date.now();
 
 // ============================================================
 // LOGGING
@@ -70,9 +84,10 @@ function timestamp() {
 }
 
 function log(level, message, data = null) {
-  const prefix = `[${timestamp()}] [${level}]`;
+  const prefix =
+    `[${timestamp()}] [${level}]`;
 
-  if (data) {
+  if (data !== null) {
     console.log(prefix, message, data);
   } else {
     console.log(prefix, message);
@@ -102,7 +117,9 @@ function success(message, data) {
 const qbit = axios.create({
   baseURL: QBIT_URL,
   timeout: HTTP_TIMEOUT,
-  validateStatus: status => status >= 200 && status < 500,
+
+  validateStatus:
+    status => status >= 200 && status < 500,
 });
 
 // ============================================================
@@ -113,18 +130,24 @@ async function loginQbit() {
   try {
     const response = await qbit.post(
       '/api/v2/auth/login',
+
       new URLSearchParams({
         username: QBIT_USERNAME,
         password: QBIT_PASSWORD,
       }),
+
       {
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Type':
+            'application/x-www-form-urlencoded',
         },
       }
     );
 
-    if (response.status !== 200 || response.data !== 'Ok.') {
+    if (
+      response.status !== 200 ||
+      response.data !== 'Ok.'
+    ) {
       throw new Error(
         `Login failed: HTTP ${response.status} ${response.data}`
       );
@@ -132,15 +155,20 @@ async function loginQbit() {
 
     qbitLoggedIn = true;
 
-    success('Connected to qBittorrent');
+    success(
+      'Successfully connected to qBittorrent'
+    );
 
     return true;
+
   } catch (err) {
+
     qbitLoggedIn = false;
 
     error(
       'qBittorrent login failed',
-      err.response?.data || err.message
+      err.response?.data ||
+      err.message
     );
 
     return false;
@@ -148,7 +176,7 @@ async function loginQbit() {
 }
 
 // ============================================================
-// ENSURE LOGIN
+// ENSURE QBIT LOGIN
 // ============================================================
 
 async function ensureQbitLogin() {
@@ -160,25 +188,39 @@ async function ensureQbitLogin() {
 }
 
 // ============================================================
-// GET ALL TORRENTS
+// GET TORRENTS
 // ============================================================
 
 async function getTorrents() {
+
   if (!(await ensureQbitLogin())) {
-    throw new Error('qBittorrent login unavailable');
+    throw new Error(
+      'Unable to login to qBittorrent'
+    );
   }
 
-  const response = await qbit.get('/api/v2/torrents/info');
+  const response =
+    await qbit.get(
+      '/api/v2/torrents/info'
+    );
 
   if (response.status === 403) {
     qbitLoggedIn = false;
 
-    throw new Error('qBittorrent session expired');
+    throw new Error(
+      'qBittorrent session expired'
+    );
   }
 
   if (response.status !== 200) {
     throw new Error(
-      `Failed to get torrents: HTTP ${response.status}`
+      `Unable to get torrents: HTTP ${response.status}`
+    );
+  }
+
+  if (!Array.isArray(response.data)) {
+    throw new Error(
+      'qBittorrent returned invalid torrent data'
     );
   }
 
@@ -190,15 +232,18 @@ async function getTorrents() {
 // ============================================================
 
 async function getTrackers(hash) {
+
   try {
-    const response = await qbit.get(
-      '/api/v2/torrents/trackers',
-      {
-        params: {
-          hash,
-        },
-      }
-    );
+
+    const response =
+      await qbit.get(
+        '/api/v2/torrents/trackers',
+        {
+          params: {
+            hash,
+          },
+        }
+      );
 
     if (response.status !== 200) {
       return [];
@@ -207,8 +252,13 @@ async function getTrackers(hash) {
     return Array.isArray(response.data)
       ? response.data
       : [];
+
   } catch (err) {
-    warn(`Unable to retrieve trackers for ${hash}`, err.message);
+
+    warn(
+      `Unable to get tracker information for ${hash}`,
+      err.message
+    );
 
     return [];
   }
@@ -219,35 +269,51 @@ async function getTrackers(hash) {
 // ============================================================
 
 function analyzeTrackers(trackers) {
-  const usableTrackers = trackers.filter(
-    tracker =>
-      tracker.url &&
-      !tracker.url.startsWith('**')
-  );
 
-  const working = usableTrackers.filter(
-    tracker =>
-      tracker.status === 2 ||
-      tracker.status === 3
-  );
+  const usableTrackers =
+    trackers.filter(
+      tracker =>
+        tracker.url &&
+        !tracker.url.startsWith('**')
+    );
 
-  const failed = usableTrackers.filter(
-    tracker => tracker.status === 4
-  );
+  const working =
+    usableTrackers.filter(
+      tracker =>
+        tracker.status === 2 ||
+        tracker.status === 3
+    );
 
-  const notContacted = usableTrackers.filter(
-    tracker => tracker.status === 1
-  );
+  const failed =
+    usableTrackers.filter(
+      tracker =>
+        tracker.status === 4
+    );
+
+  const notContacted =
+    usableTrackers.filter(
+      tracker =>
+        tracker.status === 1
+    );
 
   return {
-    total: usableTrackers.length,
-    working: working.length,
-    failed: failed.length,
-    notContacted: notContacted.length,
+
+    total:
+      usableTrackers.length,
+
+    working:
+      working.length,
+
+    failed:
+      failed.length,
+
+    notContacted:
+      notContacted.length,
 
     allFailed:
       usableTrackers.length > 0 &&
-      failed.length === usableTrackers.length,
+      failed.length ===
+        usableTrackers.length,
 
     hasWorking:
       working.length > 0,
@@ -255,60 +321,32 @@ function analyzeTrackers(trackers) {
     hasTrackers:
       usableTrackers.length > 0,
 
-    trackersWithoutPeers:
-      usableTrackers.filter(
-        tracker =>
-          Number(tracker.num_peers || 0) === 0
-      ).length,
-  };
-}
+    trackerPeerCount:
+      usableTrackers.reduce(
+        (total, tracker) =>
+          total +
+          Number(
+            tracker.num_peers || 0
+          ),
 
-// ============================================================
-// TORRENT SNAPSHOT
-// ============================================================
-
-function torrentSnapshot(torrent, trackerInfo) {
-  return {
-    hash: torrent.hash,
-    name: torrent.name,
-    state: torrent.state,
-
-    progress: Number(torrent.progress || 0),
-
-    dlspeed: Number(torrent.dlspeed || 0),
-
-    dlspeedKB:
-      Number(torrent.dlspeed || 0) / 1024,
-
-    numSeeds: Number(torrent.num_seeds || 0),
-
-    numLeechs: Number(torrent.num_leechs || 0),
-
-    numPeers: Number(torrent.num_peers || 0),
-
-    numComplete: Number(torrent.num_complete || 0),
-
-    numIncomplete: Number(torrent.num_incomplete || 0),
-
-    eta: torrent.eta,
-
-    lastActivity:
-      torrent.last_activity
-        ? new Date(
-            Number(torrent.last_activity) * 1000
-          )
-        : null,
-
-    trackerInfo,
+        0
+      ),
   };
 }
 
 // ============================================================
 // HARD FAILURE DETECTION
+//
+// IMPORTANT:
+// missingFiles IS NOT INCLUDED.
+//
+// This means missingFiles can NEVER trigger deletion.
 // ============================================================
 
 function getHardFailureReason(torrent) {
+
   switch (torrent.state) {
+
     case 'metaDL':
       return 'metadata_download_failed';
 
@@ -321,12 +359,16 @@ function getHardFailureReason(torrent) {
 }
 
 // ============================================================
-// STALLED / DEAD TORRENT ANALYSIS
+// STALLED TORRENT ANALYSIS
 // ============================================================
 
-function analyzeStalledTorrent(torrent, trackerInfo) {
-  // Not stalled at all
+function analyzeStalledTorrent(
+  torrent,
+  trackerInfo
+) {
+
   if (torrent.state !== 'stalledDL') {
+
     return {
       stalled: false,
       dead: false,
@@ -345,52 +387,53 @@ function analyzeStalledTorrent(torrent, trackerInfo) {
   const seeds =
     Number(torrent.num_seeds || 0);
 
-  const complete =
-    Number(torrent.num_complete || 0);
-
-  // qBittorrent tracker peer count
   const trackerPeers =
-    Number(torrent.num_leechs || 0) +
-    Number(torrent.num_seeds || 0);
+    trackerInfo.trackerPeerCount;
+
+  // ----------------------------------------------------------
+  // INDIVIDUAL CONDITIONS
+  // ----------------------------------------------------------
 
   if (downloadSpeed === 0) {
-    reasons.push('zero_download_speed');
+    reasons.push(
+      'zero_download_speed'
+    );
   }
 
   if (peers === 0) {
-    reasons.push('no_connected_peers');
+    reasons.push(
+      'no_connected_peers'
+    );
   }
 
   if (seeds === 0) {
-    reasons.push('no_seeds');
-  }
-
-  if (complete === 0) {
-    reasons.push('no_tracker_seeders');
+    reasons.push(
+      'no_seeds'
+    );
   }
 
   if (trackerPeers === 0) {
-    reasons.push('no_tracker_peers');
+    reasons.push(
+      'no_tracker_peers'
+    );
   }
 
-  if (trackerInfo.hasTrackers &&
-      trackerInfo.allFailed) {
-    reasons.push('all_trackers_failed');
+  if (
+    trackerInfo.hasTrackers &&
+    trackerInfo.allFailed
+  ) {
+    reasons.push(
+      'all_trackers_failed'
+    );
   }
 
-  /*
-   * IMPORTANT:
-   *
-   * We do NOT consider a torrent dead just because:
-   *
-   *   dlspeed = 0
-   *   peers = 0
-   *
-   * Torrents can temporarily have no peers.
-   *
-   * The conditions below require several independent
-   * signals to agree.
-   */
+  // ----------------------------------------------------------
+  // DEAD TORRENT DECISION
+  //
+  // We require multiple signals.
+  //
+  // This prevents a normal temporary stall from being deleted.
+  // ----------------------------------------------------------
 
   const noDownload =
     downloadSpeed === 0;
@@ -401,44 +444,60 @@ function analyzeStalledTorrent(torrent, trackerInfo) {
   const noSeeds =
     seeds === 0;
 
-  const trackerDead =
+  const noTrackerPeers =
+    trackerPeers === 0;
+
+  const trackersDead =
     trackerInfo.hasTrackers &&
     trackerInfo.allFailed;
 
-  const trackerEmpty =
-    trackerInfo.hasTrackers &&
-    trackerInfo.total > 0 &&
-    trackerInfo.working === 0 &&
-    trackerInfo.notContacted === 0;
-
   /*
-   * Conservative dead-torrent determination.
+   * Case A:
    *
-   * Case 1:
-   * Tracker infrastructure explicitly reports that
-   * all trackers have failed.
-   *
-   * OR
-   *
-   * Case 2:
-   * No peers + no seeds + no download speed +
-   * tracker has no usable peers.
+   * All trackers failed AND
+   * no peers/seeds/download.
    */
 
-  const dead =
+  const deadBecauseTrackers =
     noDownload &&
     noPeers &&
     noSeeds &&
-    (
-      trackerDead ||
-      trackerEmpty ||
-      !trackerInfo.hasTrackers
-    );
+    trackersDead;
+
+  /*
+   * Case B:
+   *
+   * There are no useful tracker peers at all.
+   *
+   * This also covers torrents with no usable tracker
+   * information.
+   */
+
+  const deadBecauseNoPeers =
+    noDownload &&
+    noPeers &&
+    noSeeds &&
+    noTrackerPeers;
+
+  const dead =
+    deadBecauseTrackers ||
+    deadBecauseNoPeers;
 
   return {
+
     stalled: true,
+
     dead,
+
     reasons,
+
+    signals: {
+      noDownload,
+      noPeers,
+      noSeeds,
+      noTrackerPeers,
+      trackersDead,
+    },
   };
 }
 
@@ -447,14 +506,19 @@ function analyzeStalledTorrent(torrent, trackerInfo) {
 // ============================================================
 
 function formatDuration(ms) {
+
   const totalSeconds =
     Math.floor(ms / 1000);
 
   const hours =
-    Math.floor(totalSeconds / 3600);
+    Math.floor(
+      totalSeconds / 3600
+    );
 
   const minutes =
-    Math.floor((totalSeconds % 3600) / 60);
+    Math.floor(
+      (totalSeconds % 3600) / 60
+    );
 
   const seconds =
     totalSeconds % 60;
@@ -463,45 +527,122 @@ function formatDuration(ms) {
 }
 
 // ============================================================
+// STARTUP GRACE CHECK
+// ============================================================
+
+function isStartupGraceActive() {
+
+  return (
+    Date.now() -
+    MONITOR_STARTED_AT <
+    STARTUP_GRACE_PERIOD
+  );
+}
+
+function startupGraceRemaining() {
+
+  const elapsed =
+    Date.now() -
+    MONITOR_STARTED_AT;
+
+  return Math.max(
+    0,
+    STARTUP_GRACE_PERIOD -
+      elapsed
+  );
+}
+
+// ============================================================
 // DELETE TORRENT
 // ============================================================
 
-async function deleteTorrent(torrent, reason) {
+async function deleteTorrent(
+  torrent,
+  reason
+) {
+
+  // ----------------------------------------------------------
+  // ABSOLUTE SAFETY CHECK
+  // ----------------------------------------------------------
+
+  if (isStartupGraceActive()) {
+
+    warn(
+      `DELETION BLOCKED BY STARTUP GRACE: ${torrent.name}`,
+
+      {
+        hash: torrent.hash,
+
+        reason,
+
+        remaining:
+          formatDuration(
+            startupGraceRemaining()
+          ),
+      }
+    );
+
+    return false;
+  }
+
   info(
     `DELETE REQUEST: ${torrent.name}`,
+
     {
       hash: torrent.hash,
+
       reason,
+
       state: torrent.state,
-      progress: torrent.progress,
-      dlspeed: torrent.dlspeed,
-      peers: torrent.numPeers,
-      seeds: torrent.numSeeds,
+
+      progress:
+        Number(torrent.progress || 0),
+
+      downloadSpeed:
+        Number(torrent.dlspeed || 0),
+
+      peers:
+        Number(torrent.num_peers || 0),
+
+      seeds:
+        Number(torrent.num_seeds || 0),
+
+      deleteFiles: true,
     }
   );
 
   try {
+
     if (!(await ensureQbitLogin())) {
       throw new Error(
         'Cannot delete because qBittorrent login failed'
       );
     }
 
-    const response = await qbit.post(
-      '/api/v2/torrents/delete',
-      new URLSearchParams({
-        hashes: torrent.hash,
-        deleteFiles: 'true',
-      }),
-      {
-        headers: {
-          'Content-Type':
-            'application/x-www-form-urlencoded',
-        },
-      }
-    );
+    const response =
+      await qbit.post(
+
+        '/api/v2/torrents/delete',
+
+        new URLSearchParams({
+
+          hashes:
+            torrent.hash,
+
+          deleteFiles:
+            'true',
+        }),
+
+        {
+          headers: {
+            'Content-Type':
+              'application/x-www-form-urlencoded',
+          },
+        }
+      );
 
     if (response.status === 403) {
+
       qbitLoggedIn = false;
 
       throw new Error(
@@ -510,6 +651,7 @@ async function deleteTorrent(torrent, reason) {
     }
 
     if (response.status !== 200) {
+
       throw new Error(
         `Delete failed: HTTP ${response.status}`
       );
@@ -517,21 +659,37 @@ async function deleteTorrent(torrent, reason) {
 
     success(
       `DELETED torrent and files: ${torrent.name}`,
+
       {
-        hash: torrent.hash,
+        hash:
+          torrent.hash,
+
         reason,
       }
     );
 
-    // Store deletion history instead of immediately
-    // losing the information.
+    // Keep an audit record in MongoDB.
     await collection.updateOne(
-      { hash: torrent.hash },
+
+      {
+        hash:
+          torrent.hash,
+      },
+
       {
         $set: {
-          deleted: true,
-          deletedAt: new Date(),
-          deletionReason: reason,
+
+          deleted:
+            true,
+
+          deletedAt:
+            new Date(),
+
+          deletionReason:
+            reason,
+
+          monitorSession:
+            MONITOR_SESSION_ID,
         },
       }
     );
@@ -539,57 +697,28 @@ async function deleteTorrent(torrent, reason) {
     return true;
 
   } catch (err) {
+
     error(
       `FAILED TO DELETE: ${torrent.name}`,
+
       {
-        hash: torrent.hash,
+        hash:
+          torrent.hash,
+
         reason,
+
         error:
           err.response?.data ||
           err.message,
       }
     );
 
-    // IMPORTANT:
-    // Do not remove the MongoDB document.
-    // This allows the next monitoring cycle to retry.
+    // DO NOT remove MongoDB record.
+    //
+    // The next cycle can retry deletion.
+
     return false;
   }
-}
-
-// ============================================================
-// RESET HEALTHY TORRENT
-// ============================================================
-
-async function markHealthy(torrent) {
-  const existing =
-    await collection.findOne({
-      hash: torrent.hash,
-      deleted: { $ne: true },
-    });
-
-  if (!existing) {
-    return;
-  }
-
-  info(
-    `RECOVERED: ${torrent.name}`,
-    {
-      hash: torrent.hash,
-      previousReason: existing.reason,
-      previousBadDuration:
-        existing.badSince
-          ? formatDuration(
-              Date.now() -
-              new Date(existing.badSince).getTime()
-            )
-          : null,
-    }
-  );
-
-  await collection.deleteOne({
-    hash: torrent.hash,
-  });
 }
 
 // ============================================================
@@ -601,53 +730,142 @@ async function processHardFailure(
   reason,
   trackerInfo
 ) {
-  const now = Date.now();
+
+  const now =
+    Date.now();
+
+  // ----------------------------------------------------------
+  // Find current-session failure record
+  // ----------------------------------------------------------
 
   let record =
     await collection.findOne({
-      hash: torrent.hash,
+
+      hash:
+        torrent.hash,
+
+      deleted:
+        { $ne: true },
     });
+
+  // ----------------------------------------------------------
+  // OLD FAILURE RECORD FROM PREVIOUS SESSION
+  // ----------------------------------------------------------
+
+  if (
+    record &&
+    record.monitorSession !==
+      MONITOR_SESSION_ID
+  ) {
+
+    info(
+      `RESETTING OLD FAILURE TIMER: ${torrent.name}`,
+
+      {
+        hash:
+          torrent.hash,
+
+        oldSession:
+          record.monitorSession,
+
+        newSession:
+          MONITOR_SESSION_ID,
+
+        reason,
+      }
+    );
+
+    await collection.deleteOne({
+      _id:
+        record._id,
+    });
+
+    record = null;
+  }
 
   // ----------------------------------------------------------
   // FIRST OBSERVATION
   // ----------------------------------------------------------
 
   if (!record) {
+
     await collection.insertOne({
-      hash: torrent.hash,
-      name: torrent.name,
+
+      hash:
+        torrent.hash,
+
+      name:
+        torrent.name,
 
       reason,
-      state: torrent.state,
 
-      badSince: new Date(now),
-      lastChecked: new Date(now),
+      state:
+        torrent.state,
+
+      badSince:
+        new Date(now),
+
+      lastChecked:
+        new Date(now),
 
       firstProgress:
-        Number(torrent.progress || 0),
+        Number(
+          torrent.progress || 0
+        ),
 
       lastProgress:
-        Number(torrent.progress || 0),
+        Number(
+          torrent.progress || 0
+        ),
 
       lastDlspeed:
-        Number(torrent.dlspeed || 0),
+        Number(
+          torrent.dlspeed || 0
+        ),
 
-      createdAt: new Date(),
+      monitorSession:
+        MONITOR_SESSION_ID,
 
-      deleted: false,
+      createdAt:
+        new Date(),
+
+      deleted:
+        false,
     });
 
     warn(
-      `FAILURE STARTED: ${torrent.name}`,
+      `FAILURE TIMER STARTED: ${torrent.name}`,
+
       {
-        hash: torrent.hash,
+        hash:
+          torrent.hash,
+
         reason,
-        state: torrent.state,
-        progress: torrent.progress,
-        dlspeedKB:
-          Number(torrent.dlspeed || 0) / 1024,
-        peers: torrent.num_peers,
-        seeds: torrent.num_seeds,
+
+        state:
+          torrent.state,
+
+        progress:
+          torrent.progress,
+
+        downloadSpeed:
+          `${(
+            Number(
+              torrent.dlspeed || 0
+            ) / 1024
+          ).toFixed(1)} KB/s`,
+
+        peers:
+          torrent.num_peers,
+
+        seeds:
+          torrent.num_seeds,
+
+        trackers:
+          trackerInfo,
+
+        deleteAfter:
+          `${FAILURE_THRESHOLD / 60000} minutes`,
       }
     );
 
@@ -655,30 +873,73 @@ async function processHardFailure(
   }
 
   // ----------------------------------------------------------
-  // UPDATE RECORD
+  // REASON CHANGED
   // ----------------------------------------------------------
 
-  await collection.updateOne(
-    { hash: torrent.hash },
-    {
-      $set: {
-        name: torrent.name,
-        reason,
-        state: torrent.state,
+  if (
+    record.reason !== reason
+  ) {
 
-        lastChecked: new Date(now),
+    warn(
+      `FAILURE REASON CHANGED: ${torrent.name}`,
 
-        lastProgress:
-          Number(torrent.progress || 0),
+      {
+        hash:
+          torrent.hash,
 
-        lastDlspeed:
-          Number(torrent.dlspeed || 0),
+        oldReason:
+          record.reason,
+
+        newReason:
+          reason,
+      }
+    );
+
+    await collection.updateOne(
+
+      {
+        _id:
+          record._id,
       },
-    }
-  );
+
+      {
+        $set: {
+
+          reason,
+
+          state:
+            torrent.state,
+
+          badSince:
+            new Date(now),
+
+          lastChecked:
+            new Date(now),
+
+          lastProgress:
+            Number(
+              torrent.progress || 0
+            ),
+
+          lastDlspeed:
+            Number(
+              torrent.dlspeed || 0
+            ),
+        },
+      }
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // CALCULATE FAILURE DURATION
+  // ----------------------------------------------------------
 
   const badSince =
-    new Date(record.badSince).getTime();
+    new Date(
+      record.badSince
+    ).getTime();
 
   const duration =
     now - badSince;
@@ -686,15 +947,54 @@ async function processHardFailure(
   const remaining =
     Math.max(
       0,
-      FAILURE_THRESHOLD - duration
+      FAILURE_THRESHOLD -
+        duration
     );
+
+  // ----------------------------------------------------------
+  // UPDATE
+  // ----------------------------------------------------------
+
+  await collection.updateOne(
+
+    {
+      _id:
+        record._id,
+    },
+
+    {
+      $set: {
+
+        state:
+          torrent.state,
+
+        lastChecked:
+          new Date(now),
+
+        lastProgress:
+          Number(
+            torrent.progress || 0
+          ),
+
+        lastDlspeed:
+          Number(
+            torrent.dlspeed || 0
+          ),
+      },
+    }
+  );
 
   info(
     `FAILED TORRENT: ${torrent.name}`,
+
     {
-      hash: torrent.hash,
+      hash:
+        torrent.hash,
+
       reason,
-      state: torrent.state,
+
+      state:
+        torrent.state,
 
       badFor:
         formatDuration(duration),
@@ -703,10 +1003,18 @@ async function processHardFailure(
         formatDuration(remaining),
 
       progress:
-        torrent.progress,
+        `${(
+          Number(
+            torrent.progress || 0
+          ) * 100
+        ).toFixed(2)}%`,
 
-      dlspeedKB:
-        Number(torrent.dlspeed || 0) / 1024,
+      downloadSpeed:
+        `${(
+          Number(
+            torrent.dlspeed || 0
+          ) / 1024
+        ).toFixed(1)} KB/s`,
 
       peers:
         torrent.num_peers,
@@ -714,16 +1022,39 @@ async function processHardFailure(
       seeds:
         torrent.num_seeds,
 
-      trackers:
-        trackerInfo,
+      trackerInfo,
     }
   );
+
+  // ----------------------------------------------------------
+  // STARTUP GRACE
+  // ----------------------------------------------------------
+
+  if (isStartupGraceActive()) {
+
+    info(
+      `DELETION BLOCKED - STARTUP GRACE ACTIVE: ${torrent.name}`,
+
+      {
+        remaining:
+          formatDuration(
+            startupGraceRemaining()
+          ),
+      }
+    );
+
+    return;
+  }
 
   // ----------------------------------------------------------
   // DELETE
   // ----------------------------------------------------------
 
-  if (duration >= FAILURE_THRESHOLD) {
+  if (
+    duration >=
+    FAILURE_THRESHOLD
+  ) {
+
     await deleteTorrent(
       torrent,
       reason
@@ -740,48 +1071,81 @@ async function processStalledTorrent(
   trackerInfo,
   stalledAnalysis
 ) {
-  if (!stalledAnalysis.dead) {
 
-    /*
-     * A stalled torrent is NOT automatically bad.
-     *
-     * We remove any previous stalled/dead timer because
-     * the evidence does not currently indicate a dead torrent.
-     */
+  // ----------------------------------------------------------
+  // NOT ENOUGH EVIDENCE
+  // ----------------------------------------------------------
+
+  if (
+    !stalledAnalysis.dead
+  ) {
 
     const existing =
       await collection.findOne({
-        hash: torrent.hash,
+
+        hash:
+          torrent.hash,
+
+        deleted:
+          { $ne: true },
       });
 
     if (
       existing &&
-      existing.reason === 'dead_stalled_download'
+      existing.reason ===
+        'dead_stalled_download'
     ) {
+
       info(
-        `STALLED TORRENT RECOVERED / NOT DEAD: ${torrent.name}`,
+        `STALL RECOVERED: ${torrent.name}`,
+
         {
-          hash: torrent.hash,
+          hash:
+            torrent.hash,
+
           previousBadDuration:
             formatDuration(
+
               Date.now() -
-              new Date(existing.badSince).getTime()
+              new Date(
+                existing.badSince
+              ).getTime()
             ),
+
+          peers:
+            torrent.num_peers,
+
+          seeds:
+            torrent.num_seeds,
+
+          downloadSpeed:
+            `${(
+              Number(
+                torrent.dlspeed || 0
+              ) / 1024
+            ).toFixed(1)} KB/s`,
         }
       );
 
       await collection.deleteOne({
-        hash: torrent.hash,
+        _id:
+          existing._id,
       });
     }
 
     info(
-      `TEMPORARILY STALLED: ${torrent.name}`,
-      {
-        hash: torrent.hash,
+      `TEMPORARILY STALLED - KEEPING: ${torrent.name}`,
 
-        speedKB:
-          Number(torrent.dlspeed || 0) / 1024,
+      {
+        hash:
+          torrent.hash,
+
+        downloadSpeed:
+          `${(
+            Number(
+              torrent.dlspeed || 0
+            ) / 1024
+          ).toFixed(1)} KB/s`,
 
         peers:
           torrent.num_peers,
@@ -790,7 +1154,7 @@ async function processStalledTorrent(
           torrent.num_seeds,
 
         trackerPeers:
-          Number(torrent.num_leechs || 0),
+          trackerInfo.trackerPeerCount,
 
         trackerStatus:
           trackerInfo,
@@ -799,7 +1163,7 @@ async function processStalledTorrent(
           stalledAnalysis.reasons,
 
         decision:
-          'KEEP - insufficient evidence of dead torrent',
+          'KEEP',
       }
     );
 
@@ -807,17 +1171,71 @@ async function processStalledTorrent(
   }
 
   // ----------------------------------------------------------
-  // GENUINELY DEAD STALLED TORRENT
+  // GENUINELY DEAD
   // ----------------------------------------------------------
 
-  const reason =
-    'dead_stalled_download';
-
   await processHardFailure(
+
     torrent,
-    reason,
+
+    'dead_stalled_download',
+
     trackerInfo
   );
+}
+
+// ============================================================
+// MARK HEALTHY
+// ============================================================
+
+async function markHealthy(torrent) {
+
+  const existing =
+    await collection.findOne({
+
+      hash:
+        torrent.hash,
+
+      deleted:
+        { $ne: true },
+    });
+
+  if (!existing) {
+    return;
+  }
+
+  info(
+    `TORRENT RECOVERED: ${torrent.name}`,
+
+    {
+      hash:
+        torrent.hash,
+
+      previousReason:
+        existing.reason,
+
+      previousBadDuration:
+        existing.badSince
+          ? formatDuration(
+              Date.now() -
+              new Date(
+                existing.badSince
+              ).getTime()
+            )
+          : null,
+
+      currentState:
+        torrent.state,
+
+      currentProgress:
+        torrent.progress,
+    }
+  );
+
+  await collection.deleteOne({
+    _id:
+      existing._id,
+  });
 }
 
 // ============================================================
@@ -825,71 +1243,67 @@ async function processStalledTorrent(
 // ============================================================
 
 async function processTorrent(torrent) {
+
   // ----------------------------------------------------------
-  // Get tracker information
+  // IMPORTANT:
+  //
+  // missingFiles is intentionally NOT processed as a failure.
+  // ----------------------------------------------------------
+
+  if (
+    torrent.state ===
+    'missingFiles'
+  ) {
+
+    info(
+      `MISSING FILES - IGNORED: ${torrent.name}`,
+
+      {
+        hash:
+          torrent.hash,
+
+        state:
+          torrent.state,
+
+        decision:
+          'NO DELETE',
+      }
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // TRACKER INFORMATION
   // ----------------------------------------------------------
 
   const trackers =
-    await getTrackers(torrent.hash);
+    await getTrackers(
+      torrent.hash
+    );
 
   const trackerInfo =
-    analyzeTrackers(trackers);
-
-  // ----------------------------------------------------------
-  // Log current torrent
-  // ----------------------------------------------------------
-
-  info(
-    `TORRENT`,
-    {
-      name: torrent.name,
-      hash: torrent.hash,
-
-      state: torrent.state,
-
-      progress:
-        `${(
-          Number(torrent.progress || 0) * 100
-        ).toFixed(2)}%`,
-
-      downloadSpeed:
-        `${(
-          Number(torrent.dlspeed || 0) / 1024
-        ).toFixed(1)} KB/s`,
-
-      uploadSpeed:
-        `${(
-          Number(torrent.upspeed || 0) / 1024
-        ).toFixed(1)} KB/s`,
-
-      peers:
-        torrent.num_peers,
-
-      seeds:
-        torrent.num_seeds,
-
-      leechers:
-        torrent.num_leechs,
-
-      eta:
-        torrent.eta,
-
-      trackers:
-        trackerInfo,
-    }
-  );
+    analyzeTrackers(
+      trackers
+    );
 
   // ----------------------------------------------------------
   // HARD FAILURE
   // ----------------------------------------------------------
 
   const hardFailure =
-    getHardFailureReason(torrent);
+    getHardFailureReason(
+      torrent
+    );
 
   if (hardFailure) {
+
     await processHardFailure(
+
       torrent,
+
       hardFailure,
+
       trackerInfo
     );
 
@@ -900,16 +1314,25 @@ async function processTorrent(torrent) {
   // STALLED DOWNLOAD
   // ----------------------------------------------------------
 
-  if (torrent.state === 'stalledDL') {
+  if (
+    torrent.state ===
+    'stalledDL'
+  ) {
+
     const stalledAnalysis =
       analyzeStalledTorrent(
+
         torrent,
+
         trackerInfo
       );
 
     await processStalledTorrent(
+
       torrent,
+
       trackerInfo,
+
       stalledAnalysis
     );
 
@@ -917,53 +1340,81 @@ async function processTorrent(torrent) {
   }
 
   // ----------------------------------------------------------
-  // EVERYTHING ELSE IS HEALTHY / NOT FAILURE
+  // EVERYTHING ELSE
   // ----------------------------------------------------------
 
-  await markHealthy(torrent);
+  await markHealthy(
+    torrent
+  );
 }
 
 // ============================================================
-// CLEAN STALE DATABASE RECORDS
+// CLEAN STALE FAILURE RECORDS
 // ============================================================
 
-async function cleanupStaleRecords(torrents) {
+async function cleanupStaleRecords(
+  torrents
+) {
+
   const hashes =
     new Set(
-      torrents.map(t => t.hash)
+      torrents.map(
+        torrent =>
+          torrent.hash
+      )
     );
 
   const records =
-    await collection.find({
-      deleted: { $ne: true },
-    }).toArray();
+    await collection
+      .find({
+        deleted:
+          { $ne: true },
+      })
+      .toArray();
 
-  for (const record of records) {
-    if (!hashes.has(record.hash)) {
+  for (
+    const record of records
+  ) {
+
+    if (
+      !hashes.has(
+        record.hash
+      )
+    ) {
+
       info(
-        `Removing stale MongoDB record`,
+        'Removing stale MongoDB failure record',
+
         {
-          hash: record.hash,
-          name: record.name,
-          reason: record.reason,
+          hash:
+            record.hash,
+
+          name:
+            record.name,
+
+          reason:
+            record.reason,
         }
       );
 
       await collection.deleteOne({
-        _id: record._id,
+        _id:
+          record._id,
       });
     }
   }
 }
 
 // ============================================================
-// MAIN MONITOR
+// MONITOR CYCLE
 // ============================================================
 
 async function monitor() {
+
   if (monitorRunning) {
+
     warn(
-      'Previous monitor cycle is still running - skipping'
+      'Previous monitor cycle still running - skipping'
     );
 
     return;
@@ -975,8 +1426,41 @@ async function monitor() {
     Date.now();
 
   try {
-    info('================================================');
-    info('STARTING MONITOR CYCLE');
+
+    info(
+      '================================================'
+    );
+
+    info(
+      'STARTING MONITOR CYCLE'
+    );
+
+    // --------------------------------------------------------
+    // STARTUP STATUS
+    // --------------------------------------------------------
+
+    if (
+      isStartupGraceActive()
+    ) {
+
+      info(
+        'STARTUP GRACE MODE ACTIVE',
+
+        {
+          remaining:
+            formatDuration(
+              startupGraceRemaining()
+            ),
+
+          deletion:
+            'DISABLED',
+        }
+      );
+    }
+
+    // --------------------------------------------------------
+    // GET TORRENTS
+    // --------------------------------------------------------
 
     const torrents =
       await getTorrents();
@@ -985,42 +1469,82 @@ async function monitor() {
       `Found ${torrents.length} torrents`
     );
 
-    for (const torrent of torrents) {
+    // --------------------------------------------------------
+    // PROCESS
+    // --------------------------------------------------------
+
+    for (
+      const torrent of torrents
+    ) {
+
       try {
-        await processTorrent(torrent);
+
+        await processTorrent(
+          torrent
+        );
+
       } catch (err) {
+
         error(
-          `Failed processing torrent: ${torrent.name}`,
+          `Error processing torrent: ${torrent.name}`,
+
           err.message
         );
       }
     }
 
+    // --------------------------------------------------------
+    // CLEAN STALE RECORDS
+    // --------------------------------------------------------
+
     await cleanupStaleRecords(
       torrents
     );
 
+    // --------------------------------------------------------
+    // COMPLETE
+    // --------------------------------------------------------
+
     info(
-      `MONITOR CYCLE COMPLETE`,
+      'MONITOR CYCLE COMPLETE',
+
       {
-        torrents: torrents.length,
+        torrentCount:
+          torrents.length,
+
         duration:
           `${Date.now() - cycleStart}ms`,
+
+        startupGrace:
+          isStartupGraceActive(),
       }
     );
 
   } catch (err) {
+
     error(
       'MONITOR CYCLE FAILED',
+
       err.response?.data ||
       err.message
     );
 
-    // Force re-login next cycle
+    /*
+     * VERY IMPORTANT:
+     *
+     * If qBittorrent itself is unavailable,
+     * force re-login next cycle.
+     *
+     * No deletion occurs because processTorrent()
+     * was never reached.
+     */
+
     qbitLoggedIn = false;
 
   } finally {
-    monitorRunning = false;
+
+    monitorRunning =
+      false;
   }
 }
 
@@ -1029,18 +1553,23 @@ async function monitor() {
 // ============================================================
 
 async function connectMongo() {
+
   mongoClient =
     new MongoClient(
       MONGO_URI,
+
       {
-        serverSelectionTimeoutMS: 10000,
+        serverSelectionTimeoutMS:
+          10000,
       }
     );
 
   await mongoClient.connect();
 
   const db =
-    mongoClient.db(MONGO_DB);
+    mongoClient.db(
+      MONGO_DB
+    );
 
   collection =
     db.collection(
@@ -1048,17 +1577,26 @@ async function connectMongo() {
     );
 
   await collection.createIndex(
-    { hash: 1 },
-    { unique: true }
+    {
+      hash: 1,
+    },
+
+    {
+      unique: true,
+    }
   );
 
-  await collection.createIndex(
-    { badSince: 1 }
-  );
+  await collection.createIndex({
+    badSince: 1,
+  });
 
-  await collection.createIndex(
-    { deleted: 1 }
-  );
+  await collection.createIndex({
+    monitorSession: 1,
+  });
+
+  await collection.createIndex({
+    deleted: 1,
+  });
 
   success(
     `MongoDB connected: ${MONGO_DB}.${MONGO_COLLECTION}`
@@ -1069,21 +1607,29 @@ async function connectMongo() {
 // GRACEFUL SHUTDOWN
 // ============================================================
 
-async function shutdown(signal) {
+async function shutdown(
+  signal
+) {
+
   info(
     `Received ${signal}. Shutting down...`
   );
 
   try {
+
     if (mongoClient) {
+
       await mongoClient.close();
+
+      success(
+        'MongoDB connection closed'
+      );
     }
 
-    success('MongoDB connection closed');
-
   } catch (err) {
+
     error(
-      'Error during shutdown',
+      'Shutdown error',
       err.message
     );
   }
@@ -1093,12 +1639,14 @@ async function shutdown(signal) {
 
 process.on(
   'SIGINT',
-  () => shutdown('SIGINT')
+  () =>
+    shutdown('SIGINT')
 );
 
 process.on(
   'SIGTERM',
-  () => shutdown('SIGTERM')
+  () =>
+    shutdown('SIGTERM')
 );
 
 // ============================================================
@@ -1106,18 +1654,34 @@ process.on(
 // ============================================================
 
 async function start() {
+
   console.log('');
-  console.log('==============================================');
-  console.log('       qBittorrent Torrent Monitor');
-  console.log('==============================================');
+  console.log(
+    '======================================================'
+  );
+  console.log(
+    '          qBittorrent Torrent Monitor'
+  );
+  console.log(
+    '======================================================'
+  );
   console.log('');
 
   info(
-    'Configuration',
+    'Monitor session started',
+
     {
-      qbitURL: QBIT_URL,
-      mongoDB: MONGO_DB,
-      collection: MONGO_COLLECTION,
+      session:
+        MONITOR_SESSION_ID,
+
+      qbitURL:
+        QBIT_URL,
+
+      mongoDB:
+        MONGO_DB,
+
+      collection:
+        MONGO_COLLECTION,
 
       checkInterval:
         `${CHECK_INTERVAL / 1000}s`,
@@ -1125,24 +1689,32 @@ async function start() {
       failureThreshold:
         `${FAILURE_THRESHOLD / 60000} minutes`,
 
-      stalledThreshold:
-        `${STALLED_THRESHOLD / 60000} minutes`,
+      startupGrace:
+        `${STARTUP_GRACE_PERIOD / 60000} minutes`,
+
+      automaticDeletion:
+        'metaDL, erroredDL, genuinely-dead stalledDL',
+
+      missingFiles:
+        'IGNORED',
     }
   );
 
   try {
+
     await connectMongo();
 
     const loggedIn =
       await loginQbit();
 
     if (!loggedIn) {
+
       throw new Error(
         'Unable to connect to qBittorrent'
       );
     }
 
-    // Immediate first check
+    // First check
     await monitor();
 
     // Continuous monitoring
@@ -1152,12 +1724,13 @@ async function start() {
     );
 
     success(
-      `Monitor started. Checking every ${
+      `Monitor started - checking every ${
         CHECK_INTERVAL / 1000
-      } seconds.`
+      } seconds`
     );
 
   } catch (err) {
+
     error(
       'FATAL STARTUP ERROR',
       err.message
@@ -1168,4 +1741,3 @@ async function start() {
 }
 
 start();
-
